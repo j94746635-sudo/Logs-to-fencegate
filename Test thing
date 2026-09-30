@@ -1,0 +1,564 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}org.gradle.jvmargs=-Xmx2G
+org.gradle.parallel=true
+
+# Versions (check https://fabricmc.net/develop for newer builds)
+minecraft_version=1.21.11
+yarn_mappings=1.21.11+build.1
+loader_version=0.18.1
+fabric_version=0.140.0+1.21.11
+
+# Mod
+mod_version=1.0.0
+maven_group=com.example
+archives_base_name=autofencegate-clientplugins {
+    id 'fabric-loom' version '1.14-SNAPSHOT'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": inputs.properties.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}{
+  "schemaVersion": 1,
+  "id": "autofencegate",
+  "version": "${version}",
+  "name": "Auto Fence Gates (Client)",
+  "description": "Open a crafting table and it crafts the logs in your inventory into fence gates for you (1 log = 1 fence gate).",
+  "authors": ["You"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.autofencegate.AutoFenceGateClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}package com.example.autofencegate;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.CraftingScreen;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
+import net.minecraft.screen.CraftingScreenHandler;
+import net.minecraft.screen.ScreenHandler;
+import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.BooleanSupplier;
+
+/**
+ * Client-side auto crafter. When a crafting table screen is open and you have logs
+ * in your inventory, it drives the real crafting table with normal click packets:
+ *
+ *   1) logs   -> planks   (1 log = 4 planks)
+ *   2) planks -> sticks   (2 planks = 4 sticks)
+ *   3) planks + sticks -> fence gates  (2 planks + 4 sticks each)
+ *
+ * A fence gate costs exactly 4 planks, so 1 log always becomes 1 fence gate.
+ * Toggle with /fencegate [on|off]. Works on servers without the mod installed.
+ */
+public class AutoFenceGateClient implements ClientModInitializer {
+    /** Slot clicks sent per client tick. Lower this if a server complains about packet rate. */
+    private static final int CLICKS_PER_TICK = 4;
+    /** How long to wait for the server to confirm a craft before giving up. */
+    private static final int WAIT_TIMEOUT_TICKS = 60;
+    /** Extra ticks to let the inventory settle after the server confirms. */
+    private static final int SETTLE_TICKS = 2;
+    private static final int MAX_CLICKS_PER_TAKE = 400;
+
+    // Crafting table slot layout: 0 = result, 1-9 = 3x3 grid, 10+ = player inventory.
+    private static final int RESULT_SLOT = 0;
+    private static final int GRID_START = 1;
+    private static final int INV_START = 10;
+
+    private record Chain(Item planks, Item gate) {}
+
+    private static final Map<Item, Chain> CHAINS = new HashMap<>();
+
+    private static boolean enabled = true;
+    private static Job job;
+    /** Table we gave up on (error / no space); we leave it alone until a new one is opened. */
+    private static CraftingScreenHandler suspended;
+
+    @Override
+    public void onInitializeClient() {
+        buildChains();
+        ClientTickEvents.END_CLIENT_TICK.register(AutoFenceGateClient::onTick);
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                dispatcher.register(ClientCommandManager.literal("fencegate")
+                        .executes(ctx -> setEnabled(ctx.getSource(), !enabled))
+                        .then(ClientCommandManager.literal("on")
+                                .executes(ctx -> setEnabled(ctx.getSource(), true)))
+                        .then(ClientCommandManager.literal("off")
+                                .executes(ctx -> setEnabled(ctx.getSource(), false)))));
+    }
+
+    private static int setEnabled(FabricClientCommandSource source, boolean on) {
+        enabled = on;
+        suspended = null;
+        source.sendFeedback(Text.literal("Auto fence gates: " + (on ? "ON" : "OFF")));
+        return 1;
+    }
+
+    // ------------------------------------------------------------------ tick
+
+    private static void onTick(MinecraftClient client) {
+        if (client.player == null || client.interactionManager == null) {
+            job = null;
+            suspended = null;
+            return;
+        }
+        if (!(client.currentScreen instanceof CraftingScreen screen)) {
+            job = null;
+            suspended = null;
+            return;
+        }
+        CraftingScreenHandler handler = screen.getScreenHandler();
+        if (suspended != null && suspended != handler) {
+            suspended = null;
+        }
+        if (job != null && job.handler != handler) {
+            job = null;
+        }
+
+        if (job != null) {
+            if (job.tick()) {
+                if (job.aborted) {
+                    notify(client, "Auto fence gates stopped: " + job.abortReason);
+                    suspended = handler;
+                }
+                job = null;
+            }
+            return;
+        }
+
+        if (!enabled || suspended == handler) {
+            return;
+        }
+        job = createJob(client, handler);
+    }
+
+    private static void notify(MinecraftClient client, String message) {
+        if (client.player != null) {
+            client.player.sendMessage(Text.literal(message), true);
+        }
+    }
+
+    // ------------------------------------------------------------ job set-up
+
+    private static Job createJob(MinecraftClient client, CraftingScreenHandler handler) {
+        // Don't interfere if the player is mid-craft.
+        if (!handler.getCursorStack().isEmpty()) {
+            return null;
+        }
+        for (int i = GRID_START; i < INV_START; i++) {
+            if (!handler.getSlot(i).getStack().isEmpty()) {
+                return null;
+            }
+        }
+
+        for (int slot = INV_START; slot < handler.slots.size(); slot++) {
+            ItemStack stack = handler.getSlot(slot).getStack();
+            if (stack.isEmpty()) {
+                continue;
+            }
+            Chain chain = CHAINS.get(stack.getItem());
+            if (chain == null) {
+                continue;
+            }
+
+            // Pick the biggest batch that fits in the free inventory space.
+            int amount = stack.getCount();
+            while (amount > 0) {
+                int free = emptySlots(handler) + (amount == stack.getCount() ? 1 : 0);
+                if (slotsNeeded(amount) <= free) {
+                    break;
+                }
+                amount--;
+            }
+            if (amount <= 0) {
+                notify(client, "Auto fence gates: free up a few inventory slots");
+                suspended = handler;
+                return null;
+            }
+
+            return buildJob(client, handler, stack.getItem(), chain, amount);
+        }
+        return null;
+    }
+
+    private static Job buildJob(MinecraftClient client, CraftingScreenHandler handler,
+                                Item log, Chain chain, int amount) {
+        Item planks = chain.planks();
+        Item gate = chain.gate();
+        int[] before = new int[3]; // planks, sticks, gates in inventory when we start
+
+        Job newJob = new Job(client, handler);
+
+        // Step 0: remember starting counts.
+        newJob.queue.add(jb -> {
+            before[0] = count(handler, planks);
+            before[1] = count(handler, Items.STICK);
+            before[2] = count(handler, gate);
+            return true;
+        });
+
+        // Step 1: logs -> planks.
+        newJob.queue.add(new Take(log, GRID_START, amount));
+        newJob.queue.add(new Click(RESULT_SLOT, 0, SlotActionType.QUICK_MOVE));
+        newJob.queue.add(new Wait(() -> count(handler, planks) >= before[0] + 4 * amount));
+
+        // Step 2: planks -> sticks (planks are looked up when this step runs).
+        newJob.queue.add(jb -> {
+            List<Step> next = List.of(
+                    new Take(planks, GRID_START, amount),
+                    new Take(planks, GRID_START + 3, amount),
+                    new Click(RESULT_SLOT, 0, SlotActionType.QUICK_MOVE),
+                    new Wait(() -> count(handler, Items.STICK) >= before[1] + 4 * amount));
+            jb.insertNext(next);
+            return true;
+        });
+
+        // Step 3: planks + sticks -> fence gates.
+        // Recipe layout:  S P S  /  S P S   (grid slots 1 2 3 / 4 5 6)
+        newJob.queue.add(jb -> {
+            List<Step> next = List.of(
+                    new Take(planks, GRID_START + 1, amount),
+                    new Take(planks, GRID_START + 4, amount),
+                    new Take(Items.STICK, GRID_START, amount),
+                    new Take(Items.STICK, GRID_START + 2, amount),
+                    new Take(Items.STICK, GRID_START + 3, amount),
+                    new Take(Items.STICK, GRID_START + 5, amount),
+                    new Click(RESULT_SLOT, 0, SlotActionType.QUICK_MOVE),
+                    new Wait(() -> count(handler, gate) >= before[2] + amount));
+            jb.insertNext(next);
+            return true;
+        });
+
+        newJob.queue.add(jb -> {
+            notify(client, "Crafted " + amount + " fence gates");
+            return true;
+        });
+        return newJob;
+    }
+
+    private static int slotsNeeded(int amount) {
+        // planks left over (2 per gate) + sticks (4 per gate) + 1 spare for fragmentation
+        return (2 * amount + 63) / 64 + (4 * amount + 63) / 64 + 1;
+    }
+
+    // ------------------------------------------------------- inventory utils
+
+    private static int findSlot(ScreenHandler handler, Item item) {
+        for (int i = INV_START; i < handler.slots.size(); i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (!stack.isEmpty() && stack.isOf(item)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static int count(ScreenHandler handler, Item item) {
+        int total = 0;
+        for (int i = INV_START; i < handler.slots.size(); i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (!stack.isEmpty() && stack.isOf(item)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private static int emptySlots(ScreenHandler handler) {
+        int n = 0;
+        for (int i = INV_START; i < handler.slots.size(); i++) {
+            if (handler.getSlot(i).getStack().isEmpty()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    // --------------------------------------------------------- step machinery
+
+    private interface Step {
+        /** @return true when finished; false to be called again next tick. */
+        boolean run(Job jb);
+    }
+
+    private static final class Job {
+        final MinecraftClient client;
+        final CraftingScreenHandler handler;
+        final Deque<Step> queue = new ArrayDeque<>();
+        int clicksLeft;
+        boolean aborted;
+        String abortReason = "";
+
+        Job(MinecraftClient client, CraftingScreenHandler handler) {
+            this.client = client;
+            this.handler = handler;
+        }
+
+        void click(int slot, int button, SlotActionType type) {
+            client.interactionManager.clickSlot(handler.syncId, slot, button, type, client.player);
+            clicksLeft--;
+        }
+
+        void insertNext(List<Step> steps) {
+            for (int i = steps.size() - 1; i >= 0; i--) {
+                queue.addFirst(steps.get(i));
+            }
+        }
+
+        void abort(String reason) {
+            aborted = true;
+            abortReason = reason;
+        }
+
+        /** @return true when the job is finished or aborted. */
+        boolean tick() {
+            clicksLeft = CLICKS_PER_TICK;
+            while (!queue.isEmpty() && !aborted) {
+                Step step = queue.peekFirst();
+                if (!step.run(this)) {
+                    break;
+                }
+                queue.removeFirstOccurrence(step);
+            }
+            return aborted || queue.isEmpty();
+        }
+    }
+
+    /** A single slot click. */
+    private static final class Click implements Step {
+        private final int slot;
+        private final int button;
+        private final SlotActionType type;
+
+        Click(int slot, int button, SlotActionType type) {
+            this.slot = slot;
+            this.button = button;
+            this.type = type;
+        }
+
+        @Override
+        public boolean run(Job jb) {
+            if (jb.clicksLeft <= 0) {
+                return false;
+            }
+            jb.click(slot, button, type);
+            return true;
+        }
+    }
+
+    /**
+     * Moves exactly {@code remaining} items of one type from the inventory into a grid slot,
+     * using the cursor: pick up a stack, place it (or right-click one at a time), and put
+     * any leftovers back where they came from.
+     */
+    private static final class Take implements Step {
+        private final Item item;
+        private final int gridSlot;
+        private int remaining;
+        private int source = -1;
+        private int clicksUsed = 0;
+
+        Take(Item item, int gridSlot, int amount) {
+            this.item = item;
+            this.gridSlot = gridSlot;
+            this.remaining = amount;
+        }
+
+        @Override
+        public boolean run(Job jb) {
+            ScreenHandler handler = jb.handler;
+            while (true) {
+                if (jb.clicksLeft <= 0) {
+                    return false;
+                }
+                if (clicksUsed > MAX_CLICKS_PER_TAKE) {
+                    jb.abort("inventory did not behave as expected");
+                    return true;
+                }
+                ItemStack cursor = handler.getCursorStack();
+                if (cursor.isEmpty()) {
+                    if (remaining <= 0) {
+                        return true;
+                    }
+                    int slot = findSlot(handler, item);
+                    if (slot < 0) {
+                        jb.abort("ran out of " + Registries.ITEM.getId(item).getPath());
+                        return true;
+                    }
+                    source = slot;
+                    jb.click(slot, 0, SlotActionType.PICKUP);
+                } else {
+                    if (!cursor.isOf(item)) {
+                        jb.abort("unexpected item on cursor");
+                        return true;
+                    }
+                    int held = cursor.getCount();
+                    if (remaining <= 0) {
+                        jb.click(source, 0, SlotActionType.PICKUP); // put leftovers back
+                    } else if (held <= remaining) {
+                        jb.click(gridSlot, 0, SlotActionType.PICKUP); // place whole stack
+                        remaining -= held;
+                    } else {
+                        jb.click(gridSlot, 1, SlotActionType.PICKUP); // place one item
+                        remaining--;
+                    }
+                }
+                clicksUsed++;
+            }
+        }
+    }
+
+    /** Waits (up to a timeout) until the server has updated our inventory as expected. */
+    private static final class Wait implements Step {
+        private final BooleanSupplier condition;
+        private int waited = 0;
+        private int settle = SETTLE_TICKS;
+        private boolean met = false;
+
+        Wait(BooleanSupplier condition) {
+            this.condition = condition;
+        }
+
+        @Override
+        public boolean run(Job jb) {
+            if (!met) {
+                if (condition.getAsBoolean()) {
+                    met = true;
+                } else if (++waited > WAIT_TIMEOUT_TICKS) {
+                    jb.abort("timed out waiting for the server");
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            return --settle < 0;
+        }
+    }
+
+    // ------------------------------------------------------------ recipe data
+
+    private static void buildChains() {
+        String[] woods = {
+                "oak", "spruce", "birch", "jungle", "acacia",
+                "dark_oak", "mangrove", "cherry", "pale_oak"
+        };
+        for (String w : woods) {
+            String planks = w + "_planks";
+            String gate = w + "_fence_gate";
+            register(w + "_log", planks, gate);
+            register("stripped_" + w + "_log", planks, gate);
+            register(w + "_wood", planks, gate);
+            register("stripped_" + w + "_wood", planks, gate);
+        }
+        String[] nether = {"crimson", "warped"};
+        for (String n : nether) {
+            String planks = n + "_planks";
+            String gate = n + "_fence_gate";
+            register(n + "_stem", planks, gate);
+            register("stripped_" + n + "_stem", planks, gate);
+            register(n + "_hyphae", planks, gate);
+            register("stripped_" + n + "_hyphae", planks, gate);
+        }
+    }
+
+    private static void register(String logId, String planksId, String gateId) {
+        Identifier logKey = Identifier.of("minecraft", logId);
+        Identifier planksKey = Identifier.of("minecraft", planksId);
+        Identifier gateKey = Identifier.of("minecraft", gateId);
+        if (Registries.ITEM.containsId(logKey)
+                && Registries.ITEM.containsId(planksKey)
+                && Registries.ITEM.containsId(gateKey)) {
+            CHAINS.put(Registries.ITEM.get(logKey),
+                    new Chain(Registries.ITEM.get(planksKey), Registries.ITEM.get(gateKey)));
+        }
+    }
+}name: Build mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofencegate-client
+          path: build/libs/*.jar
